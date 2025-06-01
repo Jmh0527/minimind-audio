@@ -156,7 +156,14 @@ class MiniMindALM(Qwen3ForCausalLM):
             return_dict=True,
         )
         
-        return {
-            'last_hidden_state': outputs.hidden_states,
-            'logits': outputs.logits
-        }
+        # return {
+        #     'last_hidden_state': outputs.hidden_states,
+        #     'logits': outputs.logits
+        # }
+
+        return CausalLMOutputWithPast(
+            logits=outputs.logits,
+            past_key_values=outputs.past_key_values if use_cache else None,
+            hidden_states=outputs.hidden_states if output_hidden_states else None,
+            attentions=outputs.attentions if output_attentions else None
+        )

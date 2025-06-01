@@ -24,11 +24,11 @@ def setup_seed(seed):
 
 
 def init_model(config: ALMConfig, device, args):
-    tokenizer = AutoTokenizer.from_pretrained('./model', use_fast=True)
-    moe_path = '_moe' if config.use_moe else ''
-    ckpt = f"{args.save_dir}/sft_alm_{config.hidden_size}{moe_path}.pth"
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", use_fast=True, local_files_only=True)
+    ckpt = f"{args.save_dir}/sft_alm.pth"
 
-    model = MiniMindALM(config)
+    model_config = ALMConfig.from_pretrained("Qwen/Qwen3-0.6B")
+    model = MiniMindALM(model_config)
     state_dict = torch.load(ckpt, map_location=device)
     model.load_state_dict(state_dict, strict=False)
 
@@ -54,9 +54,14 @@ def chat_with_alm(prompt, audio_path, model, tokenizer, processor, args):
 
     AUDIO_TOKEN = '$' * 750
     messages = [{"role": "user", "content": prompt + AUDIO_TOKEN}]
-    chat_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+    chat_prompt = tokenizer.apply_chat_template(messages, 
+                                                tokenize=False,
+                                                add_generation_prompt=True,
+                                                enable_thinking=False)
 
-    inputs = tokenizer(chat_prompt, return_tensors="pt", truncation=True).to(args.device)
+    inputs = tokenizer(chat_prompt, 
+                       return_tensors="pt", 
+                       truncation=True).to(args.device)
     input_features = input_features.to(args.device)
     feature_attention_mask = feature_attention_mask.to(args.device)
 
@@ -73,6 +78,7 @@ def chat_with_alm(prompt, audio_path, model, tokenizer, processor, args):
     output_ids = model.generate(
         input_ids=inputs["input_ids"],
         input_features=input_features.unsqueeze(0), # 训练中的input_features第一维度是堆叠起来的
+        attention_mask=inputs["attention_mask"],
         feature_attention_mask=feature_attention_mask,
         generation_config=generation_config,
         streamer=TextStreamer(tokenizer, skip_special_tokens=True, skip_prompt=True) if args.stream else None

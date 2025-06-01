@@ -45,7 +45,7 @@ def train_epoch(epoch, wandb):
             # loss_mask and feature_attention_mask do not the correct mask, modified in the forward
             res = model(input_ids=X, input_features=input_features, attention_mask=padding_mask, feature_attention_mask=feature_attention_mask)
             loss = loss_fct(
-                res['logits'].view(-1, res['logits'].size(-1)),
+                res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
 
