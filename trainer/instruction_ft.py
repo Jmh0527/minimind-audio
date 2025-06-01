@@ -17,18 +17,17 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModel
+from safetensors.torch import load_file
+
 from model.model_audio import MiniMindALM, ALMConfig
 from dataset.lm_dataset import AudioPretrainDataset, AudioSFTDataset
-
 
 def Logger(content):
     if not ddp or dist.get_rank() == 0:
         print(content)
 
-
 def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
-
 
 def train_epoch(epoch, wandb):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
@@ -42,16 +41,15 @@ def train_epoch(epoch, wandb):
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-
         with ctx:
+            # loss_mask and feature_attention_mask do not the correct mask, modified in the forward
             res = model(input_ids=X, input_features=input_features, attention_mask=padding_mask, feature_attention_mask=feature_attention_mask)
             loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
+                res['logits'].view(-1, res['logits'].size(-1)),
                 Y.view(-1)
             ).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -84,8 +82,7 @@ def train_epoch(epoch, wandb):
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
-            moe_path = '_moe' if model_config.use_moe else ''
-            ckp = f'{args.save_dir}/sft_alm_{model_config.hidden_size}{moe_path}.pth'
+            ckp = f'{args.save_dir}/sft_alm.pth'
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
@@ -99,16 +96,14 @@ def train_epoch(epoch, wandb):
             model.train()
 
 
-def init_model(model_config: ALMConfig):
-    tokenizer = AutoTokenizer.from_pretrained('../model', use_fast=True, local_files_only=True)
-    moe_path = '_moe' if model_config.use_moe else ''
-    # 加载纯语言模型权重
-    ckp = f'{args.save_dir}/pretrain_vlm_{model_config.hidden_size}{moe_path}.pth'
+def init_model():
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", use_fast=True, local_files_only=True)
+    model_config = ALMConfig.from_pretrained("Qwen/Qwen3-0.6B")
     model = MiniMindALM(model_config)
-    state_dict = torch.load(ckp, map_location=args.device)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    state_dict = torch.load('../out/pretrain_alm.pth', map_location=f"cuda:{local_rank}")
     model.load_state_dict(state_dict, strict=False)
-    
-    # freeze audio_tower
+
     for name, param in model.named_parameters():
         if 'audio_tower' in name:
             param.requires_grad = False
@@ -133,7 +128,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind-A Instruction-ft")
     parser.add_argument("--out_dir", type=str, default="../out")
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -145,8 +140,8 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_iters", type=int, default=0)
-    parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=100)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--hidden_size', default=512, type=int)
     parser.add_argument('--num_hidden_layers', default=8, type=int)
@@ -154,13 +149,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     args = parser.parse_args()
 
-    model_config = ALMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                             max_seq_len=args.max_seq_len)
-    max_seq_len = model_config.max_seq_len
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
-    tokens_per_iter = args.batch_size * max_seq_len
     torch.manual_seed(2025)
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
@@ -180,9 +171,9 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer, processor = init_model(model_config)
+    model, tokenizer, processor = init_model()
 
-    train_ds = AudioSFTDataset(args.data_path, tokenizer, processor, max_seq_len)
+    train_ds = AudioSFTDataset(args.data_path, tokenizer, processor)
     
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(

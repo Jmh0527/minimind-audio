@@ -1,36 +1,42 @@
 import os
 import warnings
 from typing import Optional, Tuple, List
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
 from transformers import AutoProcessor
 
 from .model_minimind import *
-from transformers import Qwen2AudioForConditionalGeneration
+from transformers import Qwen2AudioForConditionalGeneration, Qwen3ForCausalLM, Qwen3Config
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.cache_utils import Cache
 
 warnings.filterwarnings('ignore')
 
-
-class ALMConfig(MiniMindConfig):
+class ALMConfig(Qwen3Config):
     model_type = "minimind-a"
 
     def __init__(
-            self,
-            audio_special_token: str = '$' * 750,
-            audio_ids: List = [6] * 750,
-            **kwargs,
+        self,
+        audio_special_token: Optional[str] = None,
+        audio_ids: Optional[List[int]] = None,
+        **kwargs,
     ):
-        self.audio_special_token = audio_special_token
-        self.audio_ids = audio_ids
+        # 先调用父类初始化，加载所有标准参数
         super().__init__(**kwargs)
+        
+        # 设置自己的额外参数，若没有传入则赋默认值
+        self.audio_special_token = audio_special_token if audio_special_token is not None else '$' * 750
+        self.audio_ids = audio_ids if audio_ids is not None else [69502] * 750
+
 
 # inherit from language model
-class MiniMindALM(MiniMindForCausalLM):
+class MiniMindALM(Qwen3ForCausalLM):
     config_class = ALMConfig
 
     def __init__(self, params: ALMConfig = None, audio_size=1280, 
-                 hidden_size=512, audio_model_path="Qwen/Qwen2-Audio-7B-Instruct"):
+                 hidden_size=2048, audio_model_path="Qwen/Qwen2-Audio-7B-Instruct"):
         super().__init__(params)
         if not params: params = ALMConfig()
         self.params = params
@@ -39,12 +45,7 @@ class MiniMindALM(MiniMindForCausalLM):
         qwen_model = Qwen2AudioForConditionalGeneration.from_pretrained(audio_model_path)
         self.processor = AutoProcessor.from_pretrained(audio_model_path)
         self.audio_tower = qwen_model.audio_tower
-        del qwen_model
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+        
     @staticmethod
     def select_continuous_audio_mask(input_ids, audio_id, max_audio_tokens):
         batch_size, seq_len = input_ids.shape
@@ -59,22 +60,24 @@ class MiniMindALM(MiniMindForCausalLM):
         return mask
 
     def forward(self,
-                input_ids: Optional[torch.Tensor] = None,
+                input_ids: Optional[torch.LongTensor] = None,
                 input_features: Optional[torch.FloatTensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                feature_attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_values: Optional[Cache] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                labels: Optional[torch.LongTensor] = None,
+                use_cache: Optional[bool] = None,
+                output_attentions: Optional[bool] = None,
+                output_hidden_states: Optional[bool] = None,
+                cache_position: Optional[torch.LongTensor] = None,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
+                feature_attention_mask: Optional[torch.Tensor] = None,
                 **args):
         batch_size, seq_length = input_ids.shape
         
-        # attention_mask is padding mask here        
-        past_key_values = past_key_values or [None] * len(self.model.layers)
-        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-
         # get the input text embeddings
-        hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))
+        hidden_states = self.model.embed_tokens(input_ids)
         
         # merge text and audio
         if input_features is not None and input_ids.shape[1] != 1:
@@ -136,35 +139,24 @@ class MiniMindALM(MiniMindForCausalLM):
             else:
                 raise ValueError('Legacy processing audio tokens! Please insert <audio> tokens in the sequence.')
 
-        position_embeddings = (
-            self.model.freqs_cos[start_pos:start_pos + seq_length],
-            self.model.freqs_sin[start_pos:start_pos + seq_length]
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        presents = []
-        for layer_idx, (layer, past_key_value) in enumerate(zip(self.model.layers, past_key_values)):
-            hidden_states, present = layer(
-                hidden_states,
-                position_embeddings,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-                attention_mask=attention_mask
-            )
-            presents.append(present)
-
-        hidden_states = self.model.norm(hidden_states)
-
-        aux_loss = sum(
-            layer.mlp.aux_loss
-            for layer in self.model.layers
-            if isinstance(layer.mlp, MOEFeedForward)
-        )
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # model_inputs = self.prepare_inputs_for_generation(input_ids, past_key_values, attention_mask, cache_position)
         
-        self.OUT.__setitem__('last_hidden_state', hidden_states)
-        self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('aux_loss', aux_loss)
-        self.OUT.__setitem__('past_key_values', presents)
-
-        return self.OUT
+        outputs: BaseModelOutputWithPast = super().forward(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+        
+        return {
+            'last_hidden_state': outputs.hidden_states,
+            'logits': outputs.logits
+        }
